@@ -11,7 +11,7 @@ from lib.models.smpl import SMPL
 from lib.vis.renderer import Renderer
 
 
-def visualize_tram(seq_folder, floor_scale=2, bin_size=-1, max_faces_per_bin=30000):
+def visualize_tram(seq_folder, floor_scale=5, bin_size=-1, max_faces_per_bin=30000):
     img_folder = f'{seq_folder}/images'
     hps_folder = f'{seq_folder}/hps'
     imgfiles = sorted(glob(f'{img_folder}/*.jpg'))
@@ -85,6 +85,23 @@ def visualize_tram(seq_folder, floor_scale=2, bin_size=-1, max_faces_per_bin=300
     world_cam_T = world_cam_T - offset
     view_cam_R  = world_cam_R.mT.to('cuda')
     view_cam_T  = - torch.einsum('bij,bj->bi', world_cam_R, world_cam_T).to('cuda')
+    
+    CAM_BACK = -2.0     # metres you want to retreat
+
+    # camera forward (–Z in camera space) expressed in world coords
+    forward_w = -view_cam_R[:, 2]               # (T,3)
+
+    # project onto ground plane  ⇒  wipe out Y component
+    horiz_w = forward_w.clone()
+    horiz_w[:, 1] = 0                     # zero the vertical
+
+    # normalise so we move exactly CAM_BACK metres
+    horiz_w = torch.nn.functional.normalize(horiz_w, dim=1, eps=1e-8)
+
+    # apply translation: t_wc ← t_wc  –  CAM_BACK · horiz_w
+    view_cam_T = view_cam_T - CAM_BACK * horiz_w
+        
+        
 
     ##### Render video for visualization #####
     writer = imageio.get_writer(f'{seq_folder}/tram_output.mp4', fps=30, mode='I', 
