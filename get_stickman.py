@@ -89,24 +89,40 @@ def stream_tram_joints(
     vis = meshcat.Visualizer().open()
     vis.delete()
 
-    vis["ground"].set_object(
-        g.Box([4, 0.002, 4]),
+    # ------ frame conversion:  (x, y, z)_SMPL  →  (z, x, y)_MeshCat
+    T_smpl_to_meshcat = np.eye(4)
+    T_smpl_to_meshcat[:3, :3] = np.array([[0, 0, 1],   # new X  = old Z
+                                        [1, 0, 0],   # new Y  = old X
+                                        [0, 1, 0]])  # new Z  = old Y
+    world = vis["world"]               # a convenience handle
+    world.set_transform(T_smpl_to_meshcat)
+
+    # ground plane (put it *under* the transform)
+    world["ground"].set_object(
+        g.Box([4, 0.002, 4]),          # X-Z rectangle, thin in Y
         g.MeshLambertMaterial(color=0x555555, opacity=0.3, transparent=True)
     )
 
     sphere_geom = g.Sphere(radius=sphere_radius)
 
-    # create one sphere per track × joint
+    # one sphere per track × joint, also under "world"
     for tid in range(N):
-        r, g_, b = (pal[tid, :] * 255).astype(int)
-        col_hex  = (b << 16) + (g_ << 8) + r
-        material = g.MeshLambertMaterial(color=int(col_hex))
+        r, g_, b = (pal[tid, :] * 255).astype(int)   # r, g_, b are numpy.int64
+        col_hex  = int((b << 16) + (g_ << 8) + r)    # <-- cast to *Python* int
+        material = g.MeshLambertMaterial(color=col_hex)
         for jid in range(24):
-            vis[f"t{tid}_j{jid}"].set_object(sphere_geom, material)
+            world[f"t{tid}_j{jid}"].set_object(sphere_geom, material)
+
 
     hidden = tf.translation_matrix([1e6, 1e6, 1e6])  # off-screen
+    
+    period = 1.0 / fps
+    next_t = time.perf_counter()
 
     # 6. streaming loop -------------------------------------------------
+    
+    period = 1.0 / fps
+    next_t = time.perf_counter()
     print("▶︎  Streaming frames – Ctrl-C to stop.")
     try:
         while True:
@@ -114,13 +130,18 @@ def stream_tram_joints(
                 frame = per_frame[f]
                 for tid in range(N):
                     for jid in range(24):
-                        node = vis[f"t{tid}_j{jid}"]
+                        node = world[f"t{tid}_j{jid}"]
                         if frame[tid] is None:
                             node.set_transform(hidden)          # hide actor
                         else:
                             joint = frame[tid][jid]
                             node.set_transform(tf.translation_matrix(joint))
-                time.sleep(1.0 / fps)   # real-time pace
+                            
+                next_t += period
+                sleep_time = next_t - time.perf_counter()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                # time.sleep(1.0 / fps)   # real-time pace
     except KeyboardInterrupt:
         print("\n⏹  Stopped.")
 
