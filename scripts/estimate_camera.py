@@ -35,7 +35,7 @@ nframes = video2frames(file, img_folder)
 ##### Detection + SAM + DEVA-Track-Anything #####
 print('Detect, Segment, and Track ...')
 imgfiles = sorted(glob(f'{img_folder}/*.jpg'))
-boxes_, masks_, tracks_ = detect_segment_track(imgfiles, seq_folder, thresh=0.25, 
+boxes_, masks_, tracks_, contacts_ = detect_segment_track(imgfiles, seq_folder, thresh=0.25, 
                                                min_size=100, save_vos=args.visualize_mask)
 
 ##### Run Masked DROID-SLAM #####
@@ -55,4 +55,5 @@ np.save(f'{seq_folder}/camera.npy', camera)
 np.save(f'{seq_folder}/boxes.npy', boxes_)
 np.save(f'{seq_folder}/masks.npy', masks_)
 np.save(f'{seq_folder}/tracks.npy', tracks_)
+np.save(f'{seq_folder}/contacts.npy', contacts_)
 

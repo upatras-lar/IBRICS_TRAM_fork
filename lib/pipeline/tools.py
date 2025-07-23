@@ -11,6 +11,9 @@ from lib.utils.utils_detectron2 import DefaultPredictor_Lazy
 from detectron2.config import LazyConfig
 from lib.pipeline.deva_track import get_deva_tracker, track_with_mask, flush_buffer
 
+from ultralytics import YOLO
+import cv2
+
 
 if torch.cuda.is_available():
     autocast = torch.amp.autocast
@@ -58,6 +61,14 @@ def detect_segment_track(imgfiles, out_path, thresh=0.5, min_size=None,
     sam = sam_model_registry["vit_h"](checkpoint="data/pretrain/sam_vit_h_4b8939.pth")
     _ = sam.to(device)
     predictor = SamPredictor(sam)
+    
+    
+    # ---------------------------------- IBRICS ---------------------------------- #
+
+    foot_yolo = YOLO('data/best.pt').to(device)
+    foot_thresh = 0.25  #confidence threshold
+    
+    # ---------------------------------------------------------------------------- #
 
     # DEVA
     vid_length = len(imgfiles)
@@ -66,6 +77,11 @@ def detect_segment_track(imgfiles, out_path, thresh=0.5, min_size=None,
     # Run
     masks_ = []
     boxes_ = []
+    
+    
+    foot_boxes_ = [] # IBRICS
+    
+    
     for t, imgpath in enumerate(tqdm(imgfiles)):
         img_cv2 = cv2.imread(imgpath)
 
@@ -80,6 +96,28 @@ def detect_segment_track(imgfiles, out_path, thresh=0.5, min_size=None,
 
                 boxes = np.hstack([boxes, confs[:, None]])
                 boxes = arrange_boxes(boxes, mode='size', min_size=min_size)
+
+
+        ### --- Foot‑contact detection (YOLOv8) --- IBRICS
+        
+        with torch.no_grad():
+            with autocast('cuda'):
+                yres = foot_yolo.predict(
+                    source=img_cv2,
+                    conf=foot_thresh,
+                    device=device,
+                    verbose=False,
+                    save=False
+                )
+                foot_det = yres[0]
+                if foot_det.boxes:
+                    foot_xyxy  = foot_det.boxes.xyxy.cpu().numpy()    # shape (N,4)
+                    foot_conf  = foot_det.boxes.conf.cpu().numpy()    # shape (N,)
+                    # Combine into (x1,y1,x2,y2,conf) for downstream use:
+                    foot_boxes = np.hstack([foot_xyxy, foot_conf[:, None]])
+                else:
+                    foot_boxes = np.zeros((0, 5), dtype=float)
+
 
         ### --- SAM --- 
         if len(boxes)>0:
@@ -119,6 +157,7 @@ def detect_segment_track(imgfiles, out_path, thresh=0.5, min_size=None,
         mask_bit = masktool.encode(np.asfortranarray(mask > 0))
         masks_.append(mask_bit)
         boxes_.append(boxes)
+        foot_boxes_.append(foot_boxes)
 
     with autocast('cuda'):
         flush_buffer(deva, result_saver)
@@ -171,8 +210,8 @@ def detect_segment_track(imgfiles, out_path, thresh=0.5, min_size=None,
     tracks = np.array(tracks, dtype=object)
     masks_ = np.array(masks_, dtype=object)
     boxes_ = np.array(boxes_, dtype=object)
-
-    return boxes_, masks_, tracks
+    foot_boxes_= np.array(foot_boxes_, dtype=object)
+    return boxes_, masks_, tracks, foot_boxes_
 
 
 def parse_chunks(frame, boxes, min_len=16):

@@ -27,14 +27,37 @@ def load_bboxes(coco_json_path):
             bboxes_by_id[img_id].append(bbox)
     return fname_to_id, bboxes_by_id
 
-def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_faces_per_bin=30000):
+
+def load_foot_bboxes(seq_folder):
+    """Returns dict: filename → array of foot bboxes (N×5), or (0×5) if none."""
+    # 1) Load the object‑dtype array
+    fb = np.load(os.path.join(seq_folder, 'foot_boxes.npy'), allow_pickle=True)
+    # 2) Gather your image list
+    img_folder = os.path.join(seq_folder, 'images')
+    imgfiles   = sorted(glob(f'{img_folder}/*.jpg'))
+    assert len(fb) == len(imgfiles), \
+        f"foot_boxes.npy has {len(fb)} entries but found {len(imgfiles)} images"
+    # 3) Map basename→foot_boxes
+    return {
+        os.path.basename(imgfiles[i]): fb[i]
+        for i in range(len(fb))
+    }
+
+def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_faces_per_bin=30000, draw_contacts=True ):
     img_folder = f'{seq_folder}/images'
     hps_folder = f'{seq_folder}/hps'
     imgfiles = sorted(glob(f'{img_folder}/*.jpg'))
     hps_files = sorted(glob(f'{hps_folder}/*.npy'))
     
     
-    fname_to_id, bboxes_by_id = load_bboxes(annotations)
+    # fname_to_id, bboxes_by_id = load_bboxes(annotations)
+    
+    
+        # optionally load foot‐boxes
+    if draw_contacts:
+        foot_by_fname = load_foot_bboxes(seq_folder)
+    else:
+        foot_by_fname = {}
  
     
 
@@ -143,19 +166,49 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
     for i in tqdm(range(len(imgfiles))):
         img = cv2.imread(imgfiles[i])[:, :, ::-1].copy()
         
+        bbox_centers = []
         
         # overlay bboxes (Based on COCO, will change later)
-        fname = os.path.basename(imgfiles[i])
-        img_id = fname_to_id.get(fname)
-        bbox_centers = []
-        if img_id is not None:
-            for x, y, w, h in bboxes_by_id.get(img_id, []):
-                x, y, w, h = map(int, (x, y, w, h))
-                bx, by = x + w//2, y + h//2
-                bbox_centers.append((bx, by)) 
-                cv2.rectangle(img, (x,y), (x+w,y+h), (255,0,0), 2)
+        # fname = os.path.basename(imgfiles[i])
+        # img_id = fname_to_id.get(fname)
+        # bbox_centers = []
+        # if img_id is not None:
+        #     for x, y, w, h in bboxes_by_id.get(img_id, []):
+        #         x, y, w, h = map(int, (x, y, w, h))
+        #         bx, by = x + w//2, y + h//2
+        #         bbox_centers.append((bx, by)) 
+        #         cv2.rectangle(img, (x,y), (x+w,y+h), (255,0,0), 2)
 
         
+        
+        if draw_contacts:
+            fb = foot_by_fname.get(os.path.basename(imgfiles[i]), np.zeros((0, 5)))
+            if fb.shape[0] == 0:
+                cv2.putText(img, "no contact", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            else:
+                for x1, y1, x2, y2, conf in fb:
+                    # draw red rectangle
+                    cv2.rectangle(
+                        img,
+                        (int(x1), int(y1)),
+                        (int(x2), int(y2)),
+                        (0, 0, 255), 2
+                    )
+                    cv2.putText(
+                        img,
+                        f"{conf:.2f}",
+                        (int(x1), int(y1) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 0, 255),
+                        1,
+                        cv2.LINE_AA
+                    )
+                    # record its centre for the distance step
+                    bx = int((x1 + x2) / 2)
+                    by = int((y1 + y2) / 2)
+                    bbox_centers.append((bx, by))
         
         verts_list = track_verts[i]
         if len(verts_list)>0:
