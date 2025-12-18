@@ -77,6 +77,7 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
     ##### TRAM + VIMO #####
     pred_cam = np.load(f'{seq_folder}/camera.npy', allow_pickle=True).item()
     img_focal = pred_cam['img_focal'].item()
+    img_center = pred_cam.get('img_center', None)
     world_cam_R = torch.tensor(pred_cam['world_cam_R']).to(device)
     world_cam_T = torch.tensor(pred_cam['world_cam_T']).to(device)
 
@@ -132,7 +133,7 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
     
     
     # ---------------------------------- IBRICS ---------------------------------- #
-    CAM_BACK = -2.0     # metres you want to retreat
+    CAM_BACK = 0.0      # no retreat so render view matches input camera
 
     # camera forward (–Z in camera space) expressed in world coords
     forward_w = -view_cam_R[:, 2]               # (T,3)
@@ -159,7 +160,8 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
     
     
     # ---------------------------------------------------------------
-    disk_radius  = 10       # pixels          
+    disk_radius  = 10       # pixels
+    max_contact_dist = 50.0 # pixels threshold to deem a bbox close enough to the foot midpoint
 
     
 
@@ -221,7 +223,8 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
 
         # ---------------------------------------------------------------------------- #
         # 3-D world → camera coordinates
-        pix_int = None 
+        pix = None
+        pix_draw = None
         if len(track_joints[i]):
             j_world = torch.stack(track_joints[i]).to(device) - offset   # (N,24,3)
 
@@ -230,9 +233,14 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
 
             j_cam = torch.einsum('ij,nkj->nki', R, j_world) + T # (N,24,3)
 
-            x = img_focal * (j_cam[..., 0] / j_cam[..., 2]) + img.shape[1] / 2
-            y = img_focal * (j_cam[..., 1] / j_cam[..., 2]) + img.shape[0] / 2
-            pix_int = torch.stack([x, y], -1).round().to(torch.int32)     # (N,24,2)
+            if img_center is not None:
+                cx, cy = float(img_center[0]), float(img_center[1])
+            else:
+                cx, cy = img.shape[1] / 2, img.shape[0] / 2
+            x = img_focal * (j_cam[..., 0] / j_cam[..., 2]) + cx
+            y = img_focal * (j_cam[..., 1] / j_cam[..., 2]) + cy
+            pix = torch.stack([x, y], -1)     # float pixels
+            pix_draw = pix.round().to(torch.int32)
 
 
         # ---------------------------------------------------------------------------- #
@@ -248,10 +256,11 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
         
         
         joints_list = []
+        contact_points = []  # for drawing on the rendered view
         # ---------------------------------------------------------------------------- #
         # draw the ankles and foor joints
-        if pix_int is not None:
-            la = pix_int[0, 10]   # first body, joint 10   
+        if pix_draw is not None:
+            la = pix_draw[0, 10]   # first body, joint 10   
             cv2.circle(out,
                     (la[0].item(), la[1].item()),
                     disk_radius,
@@ -259,8 +268,8 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
                     thickness=-1)
             
     
-        if pix_int is not None:
-            ra = pix_int[0, 11]
+        if pix_draw is not None:
+            ra = pix_draw[0, 11]
             cv2.circle(out,
                     (ra[0].item(), ra[1].item()),
                     disk_radius,
@@ -268,8 +277,8 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
                     thickness=-1)
 
 
-        if pix_int is not None:
-            lf = pix_int[0, 7]   
+        if pix_draw is not None:
+            lf = pix_draw[0, 7]   
             cv2.circle(out,
                     (lf[0].item(), lf[1].item()),
                     disk_radius,
@@ -277,8 +286,8 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
                     thickness=-1)
             
 
-        if pix_int is not None:
-            rf = pix_int[0, 8]                               
+        if pix_draw is not None:
+            rf = pix_draw[0, 8]                               
             cv2.circle(out,
                     (rf[0].item(), rf[1].item()),
                     disk_radius,
@@ -288,30 +297,32 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
         # ---------------------------------------------------------------------------- #
         # get the mid point between those joints on each leg. This seems to be more robust in case of joint misalignment 
         joints_list = []
-        if pix_int is not None and pix_int.shape[0] > 0:
+        if pix is not None and pix.shape[0] > 0:
             # left foot box: joint 10 ↔ ankle 7
-            joints_list.append((pix_int[0,10], pix_int[0,7]))
+            joints_list.append((pix[0,10], pix[0,7]))
             # right foot box: joint 11 ↔ ankle 8
-            joints_list.append((pix_int[0,11], pix_int[0,8]))
+            joints_list.append((pix[0,11], pix[0,8]))
 
         # ---------------------------------------------------------------------------- #
-        # now for each bbox, find the nearest foot‐box center and draw a line
+        # now for each bbox, assign it to the closest foot midpoint and draw a line
+        foot_mids = []
+        for (j1, j2) in joints_list:
+            fx = (float(j1[0]) + float(j2[0])) / 2.0
+            fy = (float(j1[1]) + float(j2[1])) / 2.0
+            foot_mids.append((fx, fy))
+
         for bx, by in bbox_centers:
-            best_dist   = float('inf')
-            best_center = None
-            for (j1, j2) in joints_list:
-                # midpoint of this foot‐ankle pair
-                fx = (int(j1[0]) + int(j2[0])) // 2
-                fy = (int(j1[1]) + int(j2[1])) // 2
-                # Euclidean distance to bbox center
-                d = ((bx - fx)**2 + (by - fy)**2)**0.5
-                if d < best_dist:
-                    best_dist   = d
-                    best_center = (fx, fy)
-            if best_center is not None:
-                cv2.line(out, (bx, by), best_center, (255,255,0), 2)
+            if not foot_mids:
+                continue
+            dists = [((bx - fx)**2 + (by - fy)**2)**0.5 for fx, fy in foot_mids]
+            best_id = int(np.argmin(dists))
+            best_dist = dists[best_id]
+            best_center = foot_mids[best_id]
+
+            if best_center is not None and best_dist <= max_contact_dist:
+                bc_int = (int(best_center[0]), int(best_center[1]))
+                cv2.line(out, (bx, by), bc_int, (255,255,0), 2)
                 text = f"{best_dist:.1f}"
-                # choose a position a few pixels above the bbox center to put the distance in pixels:
                 text_pos = (bx - 10, by - 10)
                 cv2.putText(
                     out,
@@ -323,9 +334,37 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
                     thickness=1,
                     lineType=cv2.LINE_AA
                 )
+                contact_points.append({"pt": bc_int, "dist": best_dist, "foot": "left" if best_id == 0 else "right"})
         # ---------------------------------------------------------------------------- #
 
-        
+        # draw contact points on the rendered (right) view as well
+        if contact_points:
+            x_offset = img.shape[1]  # width of the original frame
+            for cp in contact_points:
+                cx, cy = cp["pt"]
+                cv2.circle(out, (int(cx + x_offset), int(cy)), 6, (0, 0, 255), -1)
+                cv2.putText(
+                    out,
+                    f"{cp['dist']:.1f}",
+                    (int(cx + x_offset + 8), int(cy) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 0, 0),
+                    1,
+                    cv2.LINE_AA
+                )
+        else:
+            x_offset = img.shape[1]
+            cv2.putText(
+                out,
+                "no contact",
+                (int(10 + x_offset), 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 0, 255),
+                2
+            )
+
         writer.append_data(out)
 
     writer.close()

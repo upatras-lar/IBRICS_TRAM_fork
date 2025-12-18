@@ -10,6 +10,59 @@ import meshcat.transformations as tf
 from lib.vis.traj import traj_filter
 from lib.models.smpl import SMPL
 
+# SMPL-24 bones (parent -> child)
+BONES = [
+    (0, 1), (0, 2), (0, 3),
+    (1, 4), (2, 5), (3, 6),
+    (4, 7), (5, 8), (6, 9),
+    (7, 10), (8, 11), (9, 12),
+    (9, 13), (9, 14), (12, 15),
+    (13, 16), (14, 17), (16, 18),
+    (17, 19), (18, 20), (19, 21),
+    (20, 22), (21, 23),
+]
+
+def bone_transform(a, b, eps=1e-8):
+    """
+    Return 4x4 transform that maps a unit cylinder aligned with +Y (height=1, centered at origin)
+    to a cylinder connecting points a -> b.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    v = b - a
+    L = np.linalg.norm(v)
+    if L < eps:
+        # Degenerate: hide at origin
+        return tf.translation_matrix([1e6, 1e6, 1e6])
+
+    mid = 0.5 * (a + b)
+    y = v / L  # desired +Y direction
+
+    # Build rotation matrix that takes +Y to direction y
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    axis = np.cross(up, y)
+    s = np.linalg.norm(axis)
+    c = float(np.dot(up, y))
+    if s < 1e-8:
+        # up and y are parallel (or anti-parallel)
+        if c > 0:
+            R = np.eye(3)
+        else:
+            # 180 deg around X
+            R = tf.rotation_matrix(np.pi, [1, 0, 0])[:3, :3]
+    else:
+        axis /= s
+        R = tf.rotation_matrix(np.arctan2(s, c), axis)[:3, :3]
+
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = mid
+
+    # Scale: cylinder height is along +Y. MeshCat's Cylinder is centered, height=1.
+    S = np.eye(4)
+    S[1, 1] = L  # scale along Y to match bone length
+
+    return T @ S
 
 # ────────────────────────────────────────────────────────────────────────
 def stream_tram_joints(
@@ -91,36 +144,46 @@ def stream_tram_joints(
 
     # ------ frame conversion:  (x, y, z)_SMPL  →  (z, x, y)_MeshCat
     T_smpl_to_meshcat = np.eye(4)
-    T_smpl_to_meshcat[:3, :3] = np.array([[0, 0, 1],   # new X  = old Z
-                                        [1, 0, 0],   # new Y  = old X
-                                        [0, 1, 0]])  # new Z  = old Y
-    world = vis["world"]               # a convenience handle
+    T_smpl_to_meshcat[:3, :3] = np.array([[0, 0, 1],
+                                          [1, 0, 0],
+                                          [0, 1, 0]])
+    world = vis["world"]
     world.set_transform(T_smpl_to_meshcat)
 
-    # ground plane (put it *under* the transform)
+    # ground plane
     world["ground"].set_object(
-        g.Box([4, 0.002, 4]),          # X-Z rectangle, thin in Y
+        g.Box([4, 0.002, 4]),
         g.MeshLambertMaterial(color=0x555555, opacity=0.3, transparent=True)
     )
 
     sphere_geom = g.Sphere(radius=sphere_radius)
 
-    # one sphere per track × joint, also under "world"
-    for tid in range(N):
-        r, g_, b = (pal[tid, :] * 255).astype(int)   # r, g_, b are numpy.int64
-        col_hex  = int((b << 16) + (g_ << 8) + r)    # <-- cast to *Python* int
-        material = g.MeshLambertMaterial(color=col_hex)
-        for jid in range(24):
-            world[f"t{tid}_j{jid}"].set_object(sphere_geom, material)
-
-
     hidden = tf.translation_matrix([1e6, 1e6, 1e6])  # off-screen
-    
-    period = 1.0 / fps
-    next_t = time.perf_counter()
+
+    # ---- CHANGED: bones are cylinders, transforms only (no set_object per frame)
+    bone_nodes = {}        # (tid, bid) -> node
+    bone_radius = sphere_radius * 0.35
+    unit_cyl = g.Cylinder(1.0, bone_radius)  # height=1, aligned with +Y, centered at origin
+    # bones: deep blue to complement the warm joint colors
+    bone_mat_blue = g.MeshLambertMaterial(color=0x1a4dff)
+
+    for tid in range(N):
+        r, g_, b = (pal[tid, :] * 255).astype(int)
+        col_hex  = int((b << 16) + (g_ << 8) + r)
+        joint_mat = g.MeshLambertMaterial(color=col_hex)
+        bone_mat  = bone_mat_blue
+
+        # joints
+        for jid in range(24):
+            world[f"t{tid}_j{jid}"].set_object(sphere_geom, joint_mat)
+
+        # bones
+        for bid, (p, c) in enumerate(BONES):
+            node = world[f"t{tid}_b{bid}"]
+            bone_nodes[(tid, bid)] = node
+            node.set_object(unit_cyl, bone_mat)
 
     # 6. streaming loop -------------------------------------------------
-    
     period = 1.0 / fps
     next_t = time.perf_counter()
     print("▶︎  Streaming frames – Ctrl-C to stop.")
@@ -128,20 +191,32 @@ def stream_tram_joints(
         while True:
             for f in range(T):
                 frame = per_frame[f]
+
                 for tid in range(N):
+                    if frame[tid] is None:
+                        # hide joints + bones
+                        for jid in range(24):
+                            world[f"t{tid}_j{jid}"].set_transform(hidden)
+                        for bid in range(len(BONES)):
+                            bone_nodes[(tid, bid)].set_transform(hidden)
+                        continue
+
+                    # joints
                     for jid in range(24):
-                        node = world[f"t{tid}_j{jid}"]
-                        if frame[tid] is None:
-                            node.set_transform(hidden)          # hide actor
-                        else:
-                            joint = frame[tid][jid]
-                            node.set_transform(tf.translation_matrix(joint))
-                            
+                        joint = frame[tid][jid]
+                        world[f"t{tid}_j{jid}"].set_transform(tf.translation_matrix(joint))
+
+                    # bones (transform-only)
+                    for bid, (p, c) in enumerate(BONES):
+                        a = frame[tid][p]
+                        b = frame[tid][c]
+                        bone_nodes[(tid, bid)].set_transform(bone_transform(a, b))
+
                 next_t += period
                 sleep_time = next_t - time.perf_counter()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-                # time.sleep(1.0 / fps)   # real-time pace
+
     except KeyboardInterrupt:
         print("\n⏹  Stopped.")
 
