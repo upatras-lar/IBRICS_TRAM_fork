@@ -7,6 +7,7 @@ import numpy as np
 from glob import glob
 from lib.pipeline import visualize_tram
 from get_stickman import stream_tram_joints
+import cv2
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--video', type=str, default='./example_video.mov', help='input video')
@@ -21,6 +22,11 @@ args = parser.parse_args()
 file = args.video
 root = os.path.dirname(file)
 seq = os.path.basename(file).split('.')[0]
+cap = cv2.VideoCapture(file)
+fps = cap.get(cv2.CAP_PROP_FPS)
+cap.release()
+if fps <= 0 or np.isnan(fps):
+    fps = 30
 
 seq_folder = f'results/{seq}'
 img_folder = f'{seq_folder}/images'
@@ -30,5 +36,5 @@ annotations = f'{seq_folder}/instances_default.json'
 ##### Combine camera & human motion #####
 # Render video
 print('Visualize results ...')
-visualize_tram(seq_folder, annotations=annotations, floor_scale=args.floor_scale, bin_size=args.bin_size)
+visualize_tram(seq_folder, annotations=annotations, floor_scale=args.floor_scale, bin_size=args.bin_size, fps=fps)
 # visualize_tram_joints(seq_folder, floor_scale=args.floor_scale, bin_size=args.bin_size)

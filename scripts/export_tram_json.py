@@ -158,6 +158,80 @@ def load_contacts(seq_folder, num_frames):
     return ["no_contact"] * num_frames
 
 
+def assign_boxes_to_feet(foot_boxes, foot_mids):
+    """Assign each box to nearest foot midpoint; return best dist/conf per foot."""
+    best = {
+        "left": {"dist": None, "conf": None},
+        "right": {"dist": None, "conf": None},
+    }
+    if foot_boxes is None or len(foot_boxes) == 0:
+        return best
+
+    centers = np.column_stack(
+        [((foot_boxes[:, 0] + foot_boxes[:, 2]) / 2.0), ((foot_boxes[:, 1] + foot_boxes[:, 3]) / 2.0)]
+    )
+    centers = np.round(centers).astype(int)
+    confs = foot_boxes[:, 4] if foot_boxes.shape[1] > 4 else np.ones(len(foot_boxes), dtype=float)
+
+    for (cxcy, conf) in zip(centers, confs):
+        d_left = np.linalg.norm(cxcy - foot_mids["left"])
+        d_right = np.linalg.norm(cxcy - foot_mids["right"])
+        if d_left <= d_right:
+            if best["left"]["dist"] is None or d_left < best["left"]["dist"]:
+                best["left"]["dist"] = float(d_left)
+                best["left"]["conf"] = float(conf)
+        else:
+            if best["right"]["dist"] is None or d_right < best["right"]["dist"]:
+                best["right"]["dist"] = float(d_right)
+                best["right"]["conf"] = float(conf)
+    return best
+
+
+def smooth_contact_flags(flags, fill_gap=1, drop_spike=1):
+    """Fill short gaps and drop short spikes in a boolean contact sequence."""
+    if not flags:
+        return flags
+
+    cleaned = flags[:]
+    n = len(flags)
+
+    # Fill short gaps of no_contact between contacts.
+    i = 0
+    while i < n:
+        if cleaned[i]:
+            i += 1
+            continue
+        start = i
+        while i < n and not cleaned[i]:
+            i += 1
+        end = i
+        gap_len = end - start
+        left = start - 1
+        right = end
+        if gap_len <= fill_gap and left >= 0 and right < n and cleaned[left] and cleaned[right]:
+            for j in range(start, end):
+                cleaned[j] = True
+
+    # Drop short spikes of contact between no_contact.
+    i = 0
+    while i < n:
+        if not cleaned[i]:
+            i += 1
+            continue
+        start = i
+        while i < n and cleaned[i]:
+            i += 1
+        end = i
+        run_len = end - start
+        left = start - 1
+        right = end
+        if run_len <= drop_spike and left >= 0 and right < n and (not cleaned[left]) and (not cleaned[right]):
+            for j in range(start, end):
+                cleaned[j] = False
+
+    return cleaned
+
+
 def summarize_params(params_list):
     """Compute mean/std over all frames/tracks for each parameter key."""
     if not params_list:
@@ -173,7 +247,10 @@ def summarize_params(params_list):
 
 def export_json(seq_folder, output_name="trajectories_with_contacts.json"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    max_contact_dist = 50.0  # pixels threshold: nearer than this counts as contact
+    max_contact_dist = None  # disabled: no distance gating
+    min_box_conf = None  # disabled: no confidence gating
+    fill_gap = 1  # fill gaps of <= this many frames
+    drop_spike = 1  # drop isolated spikes of <= this many frames
 
     # Determine frame count from images or camera extrinsics
     imgfiles = sorted(glob(os.path.join(seq_folder, "images", "*.jpg")))
@@ -182,7 +259,6 @@ def export_json(seq_folder, output_name="trajectories_with_contacts.json"):
         raise RuntimeError("No images found under images/.")
 
     per_frame_tracks, params_list, bones, joint_names, floor_y = compute_world_joints(seq_folder, device=device)
-    contacts_raw = load_contacts(seq_folder, num_frames)
     avg_params, std_params = summarize_params(params_list)
 
     # image size and camera intrinsics (for projection)
@@ -210,11 +286,14 @@ def export_json(seq_folder, output_name="trajectories_with_contacts.json"):
     # view_cam_T = view_cam_T - CAM_BACK * horiz_w
 
     contacts_per_frame = []
+    raw_flags = []
+    contacts_path = os.path.join(seq_folder, "foot_boxes.npy")
+    fb_array = None
+    if os.path.isfile(contacts_path):
+        fb_array = np.load(contacts_path, allow_pickle=True)
 
-    frames = []
     for f in range(num_frames):
         # Default contacts if no tracks or no boxes
-        contact_boxes = contacts_raw[f]
         tracks_here = per_frame_tracks.get(f, [])
         if not tracks_here:
             contacts_per_frame.append(
@@ -223,6 +302,7 @@ def export_json(seq_folder, output_name="trajectories_with_contacts.json"):
                     "right": {"status": "no_contact", "distance_px": None},
                 }
             )
+            raw_flags.append({"left": False, "right": False})
         else:
             # choose the first track (lowest id) for contact association
             track = sorted(tracks_here, key=lambda t: t["track_id"])[0]
@@ -235,48 +315,37 @@ def export_json(seq_folder, output_name="trajectories_with_contacts.json"):
                 "right": ((pix[8] + pix[11]) / 2.0).astype(float),
             }
 
-            fb = []
-            contacts_path = os.path.join(seq_folder, "foot_boxes.npy")
-            if os.path.isfile(contacts_path):
-                fb_array = np.load(contacts_path, allow_pickle=True)
-                if f < len(fb_array):
-                    fb = fb_array[f]
-
-            # assign each box to the nearest foot
-            best = {"left": {"dist": None}, "right": {"dist": None}}
-            if fb is not None and len(fb) > 0:
-                centers = np.column_stack(
-                    [((fb[:, 0] + fb[:, 2]) / 2.0), ((fb[:, 1] + fb[:, 3]) / 2.0)]
-                )
-                centers = np.round(centers).astype(int)
-                for cxcy in centers:
-                    d_left = np.linalg.norm(cxcy - foot_mids["left"])
-                    d_right = np.linalg.norm(cxcy - foot_mids["right"])
-                    if d_left <= d_right:
-                        if best["left"]["dist"] is None or d_left < best["left"]["dist"]:
-                            best["left"]["dist"] = float(d_left)
-                    else:
-                        if best["right"]["dist"] is None or d_right < best["right"]["dist"]:
-                            best["right"]["dist"] = float(d_right)
+            fb = fb_array[f] if (fb_array is not None and f < len(fb_array)) else []
+            best = assign_boxes_to_feet(fb, foot_mids)
+            raw_left = best["left"]["dist"] is not None
+            raw_right = best["right"]["dist"] is not None
 
             contacts_per_frame.append(
                 {
                     "left": {
-                        "status": "full_contact" if (best["left"]["dist"] is not None and best["left"]["dist"] <= max_contact_dist) else "no_contact",
+                        "status": "full_contact" if raw_left else "no_contact",
                         "distance_px": best["left"]["dist"],
                     },
                     "right": {
-                        "status": "full_contact" if (best["right"]["dist"] is not None and best["right"]["dist"] <= max_contact_dist) else "no_contact",
+                        "status": "full_contact" if raw_right else "no_contact",
                         "distance_px": best["right"]["dist"],
                     },
                 }
             )
+            raw_flags.append({"left": raw_left, "right": raw_right})
 
+    left_flags = smooth_contact_flags([rf["left"] for rf in raw_flags], fill_gap=fill_gap, drop_spike=drop_spike)
+    right_flags = smooth_contact_flags([rf["right"] for rf in raw_flags], fill_gap=fill_gap, drop_spike=drop_spike)
+
+    frames = []
+    for f in range(num_frames):
+        contacts_per_frame[f]["left"]["status"] = "full_contact" if left_flags[f] else "no_contact"
+        contacts_per_frame[f]["right"]["status"] = "full_contact" if right_flags[f] else "no_contact"
         frames.append(
             {
                 "frame": f,
-                "contact": "full_contact" if (contacts_per_frame[-1]["left"]["status"] == "full_contact" or contacts_per_frame[-1]["right"]["status"] == "full_contact") else "no_contact",
-                "contacts": contacts_per_frame[-1],
+                "contact": "full_contact" if (contacts_per_frame[f]["left"]["status"] == "full_contact" or contacts_per_frame[f]["right"]["status"] == "full_contact") else "no_contact",
+                "contacts": contacts_per_frame[f],
                 "tracks": per_frame_tracks.get(f, []),
             }
         )

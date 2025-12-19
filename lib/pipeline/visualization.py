@@ -14,6 +14,79 @@ from lib.vis.renderer import Renderer
 from itertools import pairwise
 
 
+def assign_boxes_to_feet(foot_boxes, foot_mids):
+    """Assign each box to nearest foot midpoint; return best dist/conf per foot."""
+    best = {
+        "left": {"dist": None, "conf": None},
+        "right": {"dist": None, "conf": None},
+    }
+    if foot_boxes is None or len(foot_boxes) == 0:
+        return best
+
+    centers = np.column_stack(
+        [((foot_boxes[:, 0] + foot_boxes[:, 2]) / 2.0), ((foot_boxes[:, 1] + foot_boxes[:, 3]) / 2.0)]
+    )
+    centers = np.round(centers).astype(int)
+    confs = foot_boxes[:, 4] if foot_boxes.shape[1] > 4 else np.ones(len(foot_boxes), dtype=float)
+
+    for (cxcy, conf) in zip(centers, confs):
+        d_left = np.linalg.norm(cxcy - foot_mids["left"])
+        d_right = np.linalg.norm(cxcy - foot_mids["right"])
+        if d_left <= d_right:
+            if best["left"]["dist"] is None or d_left < best["left"]["dist"]:
+                best["left"]["dist"] = float(d_left)
+                best["left"]["conf"] = float(conf)
+        else:
+            if best["right"]["dist"] is None or d_right < best["right"]["dist"]:
+                best["right"]["dist"] = float(d_right)
+                best["right"]["conf"] = float(conf)
+    return best
+
+
+def smooth_contact_flags(flags, fill_gap=1, drop_spike=1):
+    """Fill short gaps and drop short spikes in a boolean contact sequence."""
+    if not flags:
+        return flags
+
+    cleaned = flags[:]
+    n = len(flags)
+
+    # Fill short gaps of no_contact between contacts.
+    i = 0
+    while i < n:
+        if cleaned[i]:
+            i += 1
+            continue
+        start = i
+        while i < n and not cleaned[i]:
+            i += 1
+        end = i
+        gap_len = end - start
+        left = start - 1
+        right = end
+        if gap_len <= fill_gap and left >= 0 and right < n and cleaned[left] and cleaned[right]:
+            for j in range(start, end):
+                cleaned[j] = True
+
+    # Drop short spikes of contact between no_contact.
+    i = 0
+    while i < n:
+        if not cleaned[i]:
+            i += 1
+            continue
+        start = i
+        while i < n and cleaned[i]:
+            i += 1
+        end = i
+        run_len = end - start
+        left = start - 1
+        right = end
+        if run_len <= drop_spike and left >= 0 and right < n and (not cleaned[left]) and (not cleaned[right]):
+            for j in range(start, end):
+                cleaned[j] = False
+
+    return cleaned
+
 
 def load_bboxes(coco_json_path):
     """Returns two dicts: filename→image_id, and image_id→list of [x,y,w,h]."""
@@ -43,7 +116,7 @@ def load_foot_bboxes(seq_folder):
         for i in range(len(fb))
     }
 
-def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_faces_per_bin=30000, draw_contacts=True ):
+def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_faces_per_bin=30000, draw_contacts=True, fps=30):
     img_folder = f'{seq_folder}/images'
     hps_folder = f'{seq_folder}/hps'
     imgfiles = sorted(glob(f'{img_folder}/*.jpg'))
@@ -151,7 +224,7 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
         
 
     ##### Render video for visualization #####
-    writer = imageio.get_writer(f'{seq_folder}/tram_output.mp4', fps=30, mode='I', 
+    writer = imageio.get_writer(f'{seq_folder}/tram_output.mp4', fps=fps, mode='I', 
                                 format='FFMPEG', macro_block_size=1)
     img = cv2.imread(imgfiles[0])
     renderer = Renderer(img.shape[1], img.shape[0], img_focal-100, 'cuda', 
@@ -161,7 +234,48 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
     
     # ---------------------------------------------------------------
     disk_radius  = 10       # pixels
-    max_contact_dist = 50.0 # pixels threshold to deem a bbox close enough to the foot midpoint
+    max_contact_dist = None # disabled: no distance gating
+    min_box_conf = None     # disabled: no confidence gating
+    fill_gap = 1            # fill gaps of <= this many frames
+    drop_spike = 1          # drop isolated spikes of <= this many frames
+
+    # Precompute raw + smoothed contact flags per foot for overlay.
+    raw_flags = []
+    if draw_contacts:
+        for i in range(len(imgfiles)):
+            if len(track_joints[i]) == 0:
+                raw_flags.append({"left": False, "right": False})
+                continue
+
+            j_world = track_joints[i][0].to(device) - offset  # use first track
+            R = view_cam_R[i]
+            T = view_cam_T[i]
+
+            j_cam = torch.einsum('ij,kj->ki', R, j_world) + T
+            if img_center is not None:
+                cx, cy = float(img_center[0]), float(img_center[1])
+            else:
+                cx, cy = img.shape[1] / 2, img.shape[0] / 2
+            x = img_focal * (j_cam[:, 0] / j_cam[:, 2]) + cx
+            y = img_focal * (j_cam[:, 1] / j_cam[:, 2]) + cy
+            pix = torch.stack([x, y], -1).cpu().numpy()
+
+            foot_mids = {
+                "left": ((pix[7] + pix[10]) / 2.0).astype(float),
+                "right": ((pix[8] + pix[11]) / 2.0).astype(float),
+            }
+
+            fb = foot_by_fname.get(os.path.basename(imgfiles[i]), np.zeros((0, 5)))
+            best = assign_boxes_to_feet(fb, foot_mids)
+            raw_left = best["left"]["dist"] is not None
+            raw_right = best["right"]["dist"] is not None
+            raw_flags.append({"left": raw_left, "right": raw_right})
+
+        left_flags = smooth_contact_flags([rf["left"] for rf in raw_flags], fill_gap=fill_gap, drop_spike=drop_spike)
+        right_flags = smooth_contact_flags([rf["right"] for rf in raw_flags], fill_gap=fill_gap, drop_spike=drop_spike)
+    else:
+        left_flags = []
+        right_flags = []
 
     
 
@@ -211,6 +325,8 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
                     bx = int((x1 + x2) / 2)
                     by = int((y1 + y2) / 2)
                     bbox_centers.append((bx, by))
+
+            # no per-frame status text; use bottom markers instead
         
         verts_list = track_verts[i]
         if len(verts_list)>0:
@@ -311,6 +427,27 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
             fy = (float(j1[1]) + float(j2[1])) / 2.0
             foot_mids.append((fx, fy))
 
+        # ---------------------------------------------------------------------------- #
+        # draw raw vs smoothed contact markers along the bottom, aligned to x only
+        if draw_contacts and foot_mids and i < len(raw_flags):
+            raw_left = raw_flags[i]["left"]
+            raw_right = raw_flags[i]["right"]
+            sm_left = left_flags[i]
+            sm_right = right_flags[i]
+
+            # left foot = index 0, right foot = index 1
+            states = [
+                ("left", foot_mids[0][0], raw_left, sm_left),
+                ("right", foot_mids[1][0], raw_right, sm_right),
+            ]
+
+            y_base = img.shape[0] - 15
+            for _, fx, raw_on, sm_on in states:
+                raw_color = (0, 165, 255) if raw_on else (0, 0, 255)
+                sm_color = (0, 255, 0) if sm_on else (0, 0, 255)
+                cv2.circle(out, (int(fx), y_base - 10), 6, raw_color, -1)
+                cv2.circle(out, (int(fx), y_base), 6, sm_color, -1)
+
         for bx, by in bbox_centers:
             if not foot_mids:
                 continue
@@ -319,7 +456,7 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
             best_dist = dists[best_id]
             best_center = foot_mids[best_id]
 
-            if best_center is not None and best_dist <= max_contact_dist:
+            if best_center is not None and (max_contact_dist is None or best_dist <= max_contact_dist):
                 bc_int = (int(best_center[0]), int(best_center[1]))
                 cv2.line(out, (bx, by), bc_int, (255,255,0), 2)
                 text = f"{best_dist:.1f}"
@@ -355,15 +492,26 @@ def visualize_tram(seq_folder, annotations, floor_scale=5, bin_size=-1, max_face
                 )
         else:
             x_offset = img.shape[1]
-            cv2.putText(
-                out,
-                "no contact",
-                (int(10 + x_offset), 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 255),
-                2
-            )
+            if draw_contacts and i < len(raw_flags) and (left_flags[i] or right_flags[i]):
+                cv2.putText(
+                    out,
+                    "smoothed contact",
+                    (int(10 + x_offset), 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 255, 0),
+                    2
+                )
+            else:
+                cv2.putText(
+                    out,
+                    "no contact",
+                    (int(10 + x_offset), 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (0, 0, 255),
+                    2
+                )
 
         writer.append_data(out)
 
